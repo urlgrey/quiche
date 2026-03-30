@@ -12803,3 +12803,38 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+// === CTF Finding 3: tx_data underflow — VERIFIED ===
+// cargo test --package quiche --lib -- tests::ctf_tx_data --nocapture
+
+#[test]
+fn ctf_tx_data_underflow_arithmetic() {
+    let max_tx_data: u64 = 0;
+    let tx_data: u64 = 100;
+    let result = max_tx_data.wrapping_sub(tx_data);
+    assert_eq!(result, u64::MAX - 99);
+    let len: u64 = 1_000_000;
+    assert!(!(result < len), "Underflow makes connection appear unblocked");
+    let cwin_available: u64 = 65535;
+    let cap = cmp::min(cwin_available, result) as usize;
+    assert_eq!(cap, 65535);
+    let safe = max_tx_data.saturating_sub(tx_data);
+    assert_eq!(safe, 0);
+}
+
+#[test]
+#[should_panic(expected = "attempt to subtract with overflow")]
+fn ctf_tx_data_underflow_in_connection() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    // Simulate: tx_data exceeds max_tx_data (0-RTT race or accounting bug)
+    pipe.client.tx_data = pipe.client.max_tx_data + 1;
+    // This panics in debug mode (overflow), wraps in release (bypasses flow control)
+    pipe.client.update_tx_cap();
+}
+
+#[test]
+fn ctf_tx_data_initial_zero() {
+    let pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.client.max_tx_data, 0, "max_tx_data should start at 0");
+}
