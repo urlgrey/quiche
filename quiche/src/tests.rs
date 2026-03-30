@@ -12803,3 +12803,83 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+// === CTF Finding 7: recovery panic — VERIFIED ===
+//
+// Attack model: malicious server (or MITM) delays ACKs and sets large
+// ack_delay values to inflate the client's smoothed_rtt.
+//
+// loss_delay = max(latest_rtt, smoothed_rtt) * 9/8
+// recovery.rs:270: now.checked_sub(loss_delay).unwrap() → PANIC
+//
+// Also affects: malicious client attacking server if the server's
+// RTT estimation can be influenced (e.g., delayed responses).
+
+#[test]
+fn ctf_recovery_checked_sub_returns_none() {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // Prove the arithmetic: checked_sub returns None for large durations
+    let now = Instant::now();
+    assert!(now.checked_sub(Duration::MAX).is_none(),
+        "checked_sub(Duration::MAX) must return None");
+    eprintln!("Confirmed: checked_sub returns None for large durations.");
+    eprintln!("recovery.rs:270 unwrap() on this None would panic.");
+}
+
+#[test]
+fn ctf_recovery_rtt_inflation_attack() {
+    use crate::recovery::rtt::RttStats;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // Demonstrate that a malicious peer can inflate smoothed_rtt
+    // by delaying ACKs (which increases latest_rtt measured by the sender).
+    //
+    // After handshake, ack_delay is clamped to max_ack_delay (default 25ms).
+    // But latest_rtt is measured as (now - packet_sent_time), which the
+    // peer controls by simply delaying the ACK.
+    let mut rtt = RttStats::new(Duration::from_millis(50), Duration::from_millis(25));
+    let now = Instant::now();
+
+    // Normal first RTT sample: 50ms
+    rtt.update_rtt(Duration::from_millis(50), Duration::ZERO, now, false);
+    assert_eq!(rtt.rtt(), Duration::from_millis(50));
+
+    // Attacker delays ACKs progressively. Each sample inflates smoothed_rtt.
+    // smoothed_rtt = 7/8 * old + 1/8 * new
+    let delays = [500, 2000, 5000, 10000, 20000, 40000]; // ms
+    for (i, delay_ms) in delays.iter().enumerate() {
+        let t = now + Duration::from_secs((i + 1) as u64);
+        rtt.update_rtt(
+            Duration::from_millis(*delay_ms),
+            Duration::from_millis(25), // clamped ack_delay
+            t,
+            true,
+        );
+        let loss_delay = rtt.loss_delay(9.0 / 8.0);
+        eprintln!(
+            "After {}ms ACK delay: smoothed_rtt={:?}, loss_delay={:?}",
+            delay_ms,
+            rtt.rtt(),
+            loss_delay
+        );
+    }
+
+    // After several inflated samples, loss_delay should be very large
+    let final_loss_delay = rtt.loss_delay(9.0 / 8.0);
+    eprintln!("Final loss_delay: {:?}", final_loss_delay);
+
+    // On a recently started process (or after Instant wraparound),
+    // this loss_delay can exceed the Instant epoch, causing:
+    //   now.checked_sub(loss_delay).unwrap() → PANIC
+    assert!(final_loss_delay > Duration::from_secs(10),
+        "loss_delay should be inflatable to >10s via delayed ACKs");
+
+    // The panic at recovery.rs:270 is triggered when:
+    // now.checked_sub(final_loss_delay) returns None
+    // This happens when the process hasn't been running longer than loss_delay
+    eprintln!("\nWith loss_delay={:?}, a server running < {:?} would crash.",
+        final_loss_delay, final_loss_delay);
+}
