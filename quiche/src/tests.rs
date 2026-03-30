@@ -12803,3 +12803,49 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+// === CTF Finding 2: tx_buffered no self-heal — VERIFIED ===
+// cargo test --package quiche --lib -- tests::ctf_tx_buffered --nocapture
+
+#[test]
+fn ctf_tx_buffered_no_self_heal() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.client.tx_buffered, 0);
+    assert_eq!(pipe.client.tx_buffered_state, TxBufferTrackingState::Ok);
+
+    // Simulate aftermath of accounting bug
+    pipe.client.tx_buffered = 100;
+    pipe.client.check_tx_buffered_invariant();
+
+    // Detected...
+    assert_eq!(pipe.client.tx_buffered_state, TxBufferTrackingState::Inconsistent);
+    // ...but NOT fixed
+    assert_eq!(pipe.client.tx_buffered, 100,
+        "BUG: tx_buffered should be reset to 0 but remains at 100");
+}
+
+#[test]
+fn ctf_tx_buffered_stall_after_stop_sending() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(0, b"hello world", false), Ok(11));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    pipe.server.stream_shutdown(0, Shutdown::Read, 0x1).unwrap();
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Drain events
+    loop {
+        match pipe.client.stream_send(0, b"more", false) {
+            Err(Error::StreamStopped(_)) | Err(Error::Done) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    for _ in 0..20 { let _ = pipe.advance(); }
+
+    eprintln!("After STOP_SENDING: tx_buffered={}, state={:?}",
+        pipe.client.tx_buffered, pipe.client.stats().tx_buffered_state);
+}
